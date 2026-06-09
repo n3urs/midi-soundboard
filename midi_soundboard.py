@@ -4,11 +4,14 @@ MIDI Piano & Soundboard
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 Turns an Akai MPK Mini MKII into a real-time piano synthesizer + soundboard.
 
-  • MIDI Ch 1  → additive-synthesis piano (velocity-sensitive, polyphonic)
+  • MIDI Ch 1  → piano synth (velocity-sensitive, polyphonic, key-release
+    aware, sustain-pedal CC64 supported)
   • MIDI Ch 10 → per-pad audio file playback (MP3 / WAV / OGG / FLAC)
   • Drag audio files onto pads — mappings auto-saved to config.json
+  • Right-click a pad for: choose file, clear, per-pad volume
+  • Master volume slider + Stop All panic button
+  • Closing the window hides to the system tray; quit from the tray menu
   • Selectable MIDI input and audio output device (VB-Audio Cable support)
-  • Continues working while minimised (MIDI runs in a background thread)
 
 Dependencies:
     pip install PyQt6 mido python-rtmidi numpy sounddevice soundfile
@@ -29,9 +32,10 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget,
     QVBoxLayout, QHBoxLayout, QGridLayout,
     QPushButton, QLabel, QComboBox, QFrame,
+    QSlider, QMenu, QFileDialog, QSystemTrayIcon,
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer
-from PyQt6.QtGui import QFont
+from PyQt6.QtGui import QFont, QIcon, QPixmap, QPainter, QColor, QAction
 
 
 # ── Constants ─────────────────────────────────────────────────────────────────
@@ -43,12 +47,16 @@ MAX_POLYPHONY = 32      # oldest voice stolen when this limit is hit
 # Akai MPK Mini MkII Bank-A pad → MIDI note mapping.
 # The device has 8 pads in a 2×4 grid; top row is pads 5-8, bottom is 1-4.
 PAD_NOTES   = [40, 41, 42, 43,   # row 0 (top)    – pads 5-8
-               36, 37, 38, 39]   # row 1 (bottom)  – pads 1-4
+               36, 37, 38, 39]   # row 1 (bottom) – pads 1-4
 NOTE_TO_PAD = {note: idx for idx, note in enumerate(PAD_NOTES)}
 PAD_COLS    = 4   # pads per row
 
+SUSTAIN_CC  = 64   # standard MIDI sustain-pedal controller number
+
 # Config is stored in the user's home directory so it survives app moves.
 CONFIG_FILE = Path.home() / ".midi_soundboard" / "config.json"
+
+AUDIO_EXTS  = {".mp3", ".wav", ".ogg", ".flac", ".aiff", ".aif"}
 
 
 # ── Config persistence ────────────────────────────────────────────────────────
@@ -57,9 +65,11 @@ class Config:
     """Loads and saves pad mappings + device selections to a JSON file."""
 
     def __init__(self):
-        self.pad_files: dict[int, str] = {}   # pad_index (0-15) → file path
-        self.midi_device: str  = ""
-        self.audio_device: str = ""
+        self.pad_files:   dict[int, str]   = {}   # pad index → file path
+        self.pad_volumes: dict[int, float] = {}   # pad index → gain 0.0-1.0
+        self.midi_device:  str   = ""
+        self.audio_device: str   = ""
+        self.master:       float = 0.9
         self._load()
 
     def _load(self):
@@ -68,8 +78,11 @@ class Config:
         try:
             raw = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
             self.pad_files    = {int(k): v for k, v in raw.get("pads", {}).items()}
+            self.pad_volumes  = {int(k): float(v)
+                                 for k, v in raw.get("pad_volumes", {}).items()}
             self.midi_device  = raw.get("midi_device", "")
             self.audio_device = raw.get("audio_device", "")
+            self.master       = float(raw.get("master", 0.9))
         except Exception:
             pass  # corrupt config → start fresh
 
@@ -77,8 +90,10 @@ class Config:
         CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
         CONFIG_FILE.write_text(json.dumps({
             "pads":         {str(k): v for k, v in self.pad_files.items()},
+            "pad_volumes":  {str(k): v for k, v in self.pad_volumes.items()},
             "midi_device":  self.midi_device,
             "audio_device": self.audio_device,
+            "master":       self.master,
         }, indent=2), encoding="utf-8")
 
 
@@ -95,37 +110,58 @@ def note_name(note: int) -> str:
 
 def synthesise_note(freq: float) -> np.ndarray:
     """
-    Additive synthesis of a piano-like tone.
-    Returns a stereo float32 array of shape (N, 2), peak ≤ 0.70.
+    Piano-like tone via additive synthesis. Returns stereo float32 (N, 2).
 
-    Technique: sum of harmonics, each with its own exponential decay rate
-    (upper harmonics decay faster, giving a piano's characteristic brightness
-    at the attack that fades to a pure fundamental).
+    What makes it sound piano-ish rather than organ-ish:
+      • inharmonicity — real piano strings are stiff, so upper partials run
+        progressively sharp (f_h = f·h·√(1+B·h²))
+      • per-partial decay — high partials die quickly, leaving a mellow tail
+      • a short filtered-noise "hammer" transient at the attack
+      • per-partial stereo panning for width
+    Release shaping (key-up / sustain pedal) is handled live by the Voice.
     """
-    # Lower notes ring longer than upper notes.
-    duration  = float(np.clip(55_000 / (freq * 30), 0.8, 3.2))
+    duration  = float(np.clip(6.0 * (110.0 / freq) ** 0.5, 1.2, 6.0))
     n_samples = int(duration * SAMPLE_RATE)
     t         = np.linspace(0.0, duration, n_samples, dtype=np.float32)
 
-    # (harmonic multiple, relative amplitude, decay constant)
-    partials = [(1, 1.00, 2.5), (2, 0.55, 3.5), (3, 0.30, 5.5),
-                (4, 0.15, 8.0), (5, 0.07, 11.0), (6, 0.03, 15.0)]
+    B     = 0.0004                       # string-stiffness coefficient
+    left  = np.zeros(n_samples, dtype=np.float32)
+    right = np.zeros(n_samples, dtype=np.float32)
 
-    mono = np.zeros(n_samples, dtype=np.float32)
-    for h, amp, decay in partials:
-        if freq * h < SAMPLE_RATE / 2:          # Nyquist guard
-            env   = np.exp(-decay * t / duration).astype(np.float32)
-            mono += amp * env * np.sin(2 * np.pi * freq * h * t).astype(np.float32)
+    for h in range(1, 13):
+        fh = freq * h * np.sqrt(1.0 + B * h * h)
+        if fh >= SAMPLE_RATE / 2:        # Nyquist guard
+            break
+        amp     = 1.0 / (h ** 1.8)
+        env     = np.exp(-t * (2.2 + 0.7 * h) / duration).astype(np.float32)
+        partial = (amp * env *
+                   np.sin(2 * np.pi * fh * t).astype(np.float32))
+        # Spread partials across the stereo field for a wider, livelier tone.
+        pan    = 0.5 + 0.18 * np.sin(h * 2.1 + freq * 0.01)
+        left  += partial * np.float32(np.cos(pan * np.pi / 2))
+        right += partial * np.float32(np.sin(pan * np.pi / 2))
 
-    # 3 ms linear ramp to eliminate the click at note onset.
-    ramp = max(1, int(0.003 * SAMPLE_RATE))
-    mono[:ramp] *= np.linspace(0.0, 1.0, ramp, dtype=np.float32)
+    # Hammer transient: 10 ms of low-passed noise mixed into the attack.
+    n_thump = int(0.010 * SAMPLE_RATE)
+    rng     = np.random.default_rng(int(freq))   # deterministic per note
+    noise   = rng.standard_normal(n_thump).astype(np.float32)
+    noise   = np.convolve(noise, np.ones(48, dtype=np.float32) / 48,
+                          mode="same").astype(np.float32)
+    noise  *= np.linspace(1.0, 0.0, n_thump, dtype=np.float32) * 0.6
+    left[:n_thump]  += noise
+    right[:n_thump] += noise
 
-    peak = float(np.max(np.abs(mono)))
+    # 3 ms linear ramp removes the click at note onset.
+    ramp  = max(1, int(0.003 * SAMPLE_RATE))
+    onset = np.linspace(0.0, 1.0, ramp, dtype=np.float32)
+    left[:ramp]  *= onset
+    right[:ramp] *= onset
+
+    stereo = np.column_stack([left, right])
+    peak   = float(np.max(np.abs(stereo)))
     if peak:
-        mono *= 0.70 / peak
-
-    return np.column_stack([mono, mono])   # mono → (N, 2) stereo
+        stereo *= 0.70 / peak
+    return stereo
 
 
 class NoteCache:
@@ -141,44 +177,65 @@ class NoteCache:
     def warm_up(self):
         """Call from a worker thread — blocks until all notes are ready."""
         for note in range(21, 109):
-            self._get_unlocked(note)
+            self.get(note)
 
     def get(self, note: int) -> np.ndarray:
         with self._lock:
-            return self._get_unlocked(note)
-
-    def _get_unlocked(self, note: int) -> np.ndarray:
-        if note not in self._data:
-            self._data[note] = synthesise_note(midi_to_hz(note))
-        return self._data[note]
+            if note not in self._data:
+                self._data[note] = synthesise_note(midi_to_hz(note))
+            return self._data[note]
 
 
 # ── Audio engine ──────────────────────────────────────────────────────────────
 
 class Voice:
     """
-    A cursor over a pre-computed stereo buffer.
-    Used for both piano notes and soundboard samples.
-    """
-    __slots__ = ("buf", "pos", "gain", "done")
+    A cursor over a pre-computed stereo buffer, with an optional live
+    release fade (used for key-up, retriggered pads, and Stop All).
 
-    def __init__(self, buf: np.ndarray, gain: float = 1.0):
+    `tag` identifies the voice for targeted control:
+        ("note", midi_note)  → piano voice
+        ("pad",  pad_index)  → soundboard voice
+    """
+    __slots__ = ("buf", "pos", "gain", "done", "tag",
+                 "_rel_total", "_rel_left")
+
+    def __init__(self, buf: np.ndarray, gain: float = 1.0, tag=None):
         self.buf  = buf      # (N, 2) float32
         self.pos  = 0
         self.gain = np.float32(gain)
         self.done = False
+        self.tag  = tag
+        self._rel_total = 0   # >0 once a release has been triggered
+        self._rel_left  = 0
+
+    def start_release(self, fast: bool = False):
+        """Begin fading this voice out (80 ms normally, 15 ms for cuts)."""
+        if self._rel_total or self.done:
+            return
+        self._rel_total = int((0.015 if fast else 0.080) * SAMPLE_RATE)
+        self._rel_left  = self._rel_total
 
     def read(self, n: int) -> np.ndarray:
         if self.done:
             return np.zeros((n, 2), dtype=np.float32)
-        remaining = len(self.buf) - self.pos
         chunk     = self.buf[self.pos : self.pos + n]
         self.pos += n
         if self.pos >= len(self.buf):
             self.done = True
-        # Zero-pad the final fragment so the caller always gets exactly n frames.
         if len(chunk) < n:
             chunk = np.pad(chunk, ((0, n - len(chunk)), (0, 0)))
+        else:
+            chunk = chunk.copy()          # never scale the shared cached buffer
+
+        if self._rel_total:
+            # Linear fade from the current release position down to silence.
+            r0 = self._rel_left / self._rel_total
+            r1 = max(0.0, (self._rel_left - n) / self._rel_total)
+            chunk *= np.linspace(r0, r1, n, dtype=np.float32)[:, None]
+            self._rel_left -= n
+            if self._rel_left <= 0:
+                self.done = True
         return chunk * self.gain
 
 
@@ -188,11 +245,14 @@ class AudioEngine:
     All public methods are thread-safe; they are called from the MIDI thread.
     """
 
-    def __init__(self):
+    def __init__(self, master: float = 0.9):
         self._voices : list[Voice]           = []
-        self._samples: dict[str, np.ndarray] = {}   # path → (N,2) float32 cache
-        self._lock   = threading.Lock()
+        self._samples: dict[str, np.ndarray] = {}   # path → (N,2) float32
+        self._lock    = threading.Lock()
         self._stream : sd.OutputStream | None = None
+        self._master  = np.float32(master)
+        self._sustain = False
+        self._deferred: set[int] = set()   # notes released while pedal down
 
     # ── Life-cycle ─────────────────────────────────────────────────────────
 
@@ -229,25 +289,64 @@ class AudioEngine:
             for v in self._voices:
                 mix += v.read(frames)
             self._voices = [v for v in self._voices if not v.done]
+        mix *= self._master
         # Hard-clip to [-1, 1] prevents distortion when many voices overlap.
         np.clip(mix, -1.0, 1.0, out=out)
 
     # ── Public play API ────────────────────────────────────────────────────
 
-    def play_note(self, buf: np.ndarray, velocity: float):
-        """Inject a piano voice. velocity is 0.0–1.0."""
-        voice = Voice(buf, velocity * 0.8)   # 0.8 leaves headroom for polyphony
+    def play_note(self, buf: np.ndarray, velocity: float, note: int):
+        """Start a piano voice. Restriking a ringing note cuts the old one."""
+        voice = Voice(buf, velocity * 0.8, tag=("note", note))
         with self._lock:
+            for v in self._voices:
+                if v.tag == ("note", note):
+                    v.start_release(fast=True)
+            self._deferred.discard(note)
             if len(self._voices) >= MAX_POLYPHONY:
                 self._voices.pop(0)           # steal the oldest voice
             self._voices.append(voice)
 
-    def play_pad(self, path: str):
-        """Trigger a soundboard sample at full volume."""
+    def note_off(self, note: int):
+        """Key released: fade the note out, unless the sustain pedal is down."""
+        with self._lock:
+            if self._sustain:
+                self._deferred.add(note)
+                return
+            for v in self._voices:
+                if v.tag == ("note", note):
+                    v.start_release()
+
+    def set_sustain(self, down: bool):
+        """CC64 sustain pedal. Releasing it fades all deferred notes."""
+        with self._lock:
+            self._sustain = down
+            if not down:
+                for v in self._voices:
+                    if v.tag and v.tag[0] == "note" and v.tag[1] in self._deferred:
+                        v.start_release()
+                self._deferred.clear()
+
+    def play_pad(self, path: str, pad_idx: int, gain: float = 1.0):
+        """Trigger a soundboard sample; retriggering cuts the previous play."""
         buf = self._load(path)
-        if buf is not None:
-            with self._lock:
-                self._voices.append(Voice(buf, 1.0))
+        if buf is None:
+            return
+        with self._lock:
+            for v in self._voices:
+                if v.tag == ("pad", pad_idx):
+                    v.start_release(fast=True)
+            self._voices.append(Voice(buf, gain, tag=("pad", pad_idx)))
+
+    def stop_all(self):
+        """Panic button: quick-fade every active voice."""
+        with self._lock:
+            for v in self._voices:
+                v.start_release(fast=True)
+            self._deferred.clear()
+
+    def set_master(self, gain: float):
+        self._master = np.float32(gain)
 
     def preload(self, path: str):
         """Load a file into the cache so the first trigger has no latency."""
@@ -305,6 +404,7 @@ class MidiListener(QThread):
 
     note_on  = pyqtSignal(int, int, int)   # channel (1-based), note, velocity
     note_off = pyqtSignal(int, int)        # channel, note
+    cc       = pyqtSignal(int, int, int)   # channel, controller, value
 
     def __init__(self):
         super().__init__()
@@ -346,11 +446,15 @@ class MidiListener(QThread):
 
     def _on_msg(self, msg):
         """Called by the mido/rtmidi internal thread for every incoming message."""
+        if not hasattr(msg, "channel"):
+            return
         ch = msg.channel + 1   # mido uses 0-indexed channels; we use 1-indexed
         if msg.type == "note_on":
             self.note_on.emit(ch, msg.note, msg.velocity)
         elif msg.type == "note_off":
             self.note_off.emit(ch, msg.note)
+        elif msg.type == "control_change":
+            self.cc.emit(ch, msg.control, msg.value)
 
     def stop_listener(self):
         self._alive = False
@@ -361,30 +465,32 @@ class MidiListener(QThread):
 
 class PadWidget(QFrame):
     """
-    One cell of the 4×4 soundboard grid.
-    Accepts drag-and-drop of audio files and flashes on MIDI trigger.
+    One cell of the 2×4 soundboard grid.
+    Drag-and-drop to assign a file; right-click for choose / clear / volume.
+    Flashes on MIDI trigger.
     """
 
-    file_dropped = pyqtSignal(int, str)   # (pad_index, absolute_file_path)
+    file_dropped   = pyqtSignal(int, str)     # (pad_index, file_path)
+    cleared        = pyqtSignal(int)          # (pad_index)
+    volume_changed = pyqtSignal(int, float)   # (pad_index, gain 0.0-1.0)
 
     _C_EMPTY  = "#202030"
     _C_LOADED = "#1a3326"
     _C_FLASH  = "#4a7aff"
     _C_DRAG   = "#2a3a5a"
 
-    _AUDIO_EXTS = {".mp3", ".wav", ".ogg", ".flac", ".aiff", ".aif"}
-
     def __init__(self, index: int):
         super().__init__()
         self.index     = index
         self.file_path = ""
+        self.volume    = 1.0
 
         self._timer = QTimer(self)
         self._timer.setSingleShot(True)
         self._timer.timeout.connect(self._dim)
 
         self.setAcceptDrops(True)
-        self.setMinimumSize(96, 72)
+        self.setMinimumSize(110, 84)
         self.setFrameStyle(QFrame.Shape.Box)
 
         lay = QVBoxLayout(self)
@@ -400,8 +506,13 @@ class PadWidget(QFrame):
         self._name.setWordWrap(True)
         self._name.setFont(QFont("Segoe UI", 7))
 
+        self._vol = QLabel("")
+        self._vol.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._vol.setFont(QFont("Segoe UI", 7))
+
         lay.addWidget(self._num)
         lay.addWidget(self._name)
+        lay.addWidget(self._vol)
 
         self._apply_bg(self._C_EMPTY)
 
@@ -425,14 +536,48 @@ class PadWidget(QFrame):
         self._name.setText(display)
         self._dim()
 
+    def set_volume(self, gain: float):
+        self.volume = gain
+        self._vol.setText(f"vol {int(gain * 100)}%" if gain < 1.0 else "")
+
     def _dim(self):
         self._apply_bg(self._C_LOADED if self.file_path else self._C_EMPTY)
+
+    # ── Right-click menu ───────────────────────────────────────────────────
+
+    def contextMenuEvent(self, event):
+        menu = QMenu(self)
+        act_choose = menu.addAction("Choose file…")
+        act_clear  = menu.addAction("Clear file")
+        act_clear.setEnabled(bool(self.file_path))
+        vol_menu   = menu.addMenu("Volume")
+        for pct in (25, 50, 75, 100):
+            a = QAction(f"{pct}%", vol_menu)
+            a.setCheckable(True)
+            a.setChecked(abs(self.volume - pct / 100) < 0.01)
+            a.setData(pct / 100)
+            vol_menu.addAction(a)
+
+        chosen = menu.exec(event.globalPos())
+        if chosen is act_choose:
+            exts = " ".join(f"*{e}" for e in sorted(AUDIO_EXTS))
+            path, _ = QFileDialog.getOpenFileName(
+                self, "Choose audio file", "", f"Audio files ({exts})")
+            if path:
+                self.set_file(path)
+                self.file_dropped.emit(self.index, path)
+        elif chosen is act_clear:
+            self.set_file("")
+            self.cleared.emit(self.index)
+        elif chosen is not None and chosen.data() is not None:
+            self.set_volume(float(chosen.data()))
+            self.volume_changed.emit(self.index, self.volume)
 
     # ── Drag-and-drop ──────────────────────────────────────────────────────
 
     def dragEnterEvent(self, event):
         if event.mimeData().hasUrls():
-            if any(Path(u.toLocalFile()).suffix.lower() in self._AUDIO_EXTS
+            if any(Path(u.toLocalFile()).suffix.lower() in AUDIO_EXTS
                    for u in event.mimeData().urls()):
                 event.acceptProposedAction()
                 self._apply_bg(self._C_DRAG)
@@ -443,7 +588,7 @@ class PadWidget(QFrame):
     def dropEvent(self, event):
         for url in event.mimeData().urls():
             path = url.toLocalFile()
-            if Path(path).suffix.lower() in self._AUDIO_EXTS:
+            if Path(path).suffix.lower() in AUDIO_EXTS:
                 self.set_file(path)
                 self.file_dropped.emit(self.index, path)
                 break
@@ -452,17 +597,36 @@ class PadWidget(QFrame):
 
 # ── Main window ───────────────────────────────────────────────────────────────
 
+def _make_app_icon() -> QIcon:
+    """Draw a simple ♪ tile so the tray/taskbar has an icon without assets."""
+    pm = QPixmap(64, 64)
+    pm.fill(Qt.GlobalColor.transparent)
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+    p.setBrush(QColor("#4a7aff"))
+    p.setPen(Qt.PenStyle.NoPen)
+    p.drawRoundedRect(2, 2, 60, 60, 14, 14)
+    p.setPen(QColor("white"))
+    p.setFont(QFont("Segoe UI", 34, QFont.Weight.Bold))
+    p.drawText(pm.rect(), Qt.AlignmentFlag.AlignCenter, "♪")
+    p.end()
+    return QIcon(pm)
+
+
 class MainWindow(QMainWindow):
 
     def __init__(self):
         super().__init__()
         self.cfg   = Config()
-        self.audio = AudioEngine()
+        self.audio = AudioEngine(master=self.cfg.master)
         self.cache = NoteCache()
         self.midi  = MidiListener()
         self.pads: list[PadWidget] = []
+        self._quitting    = False
+        self._tray_warned = False
 
         self._build_ui()
+        self._build_tray()
         self._populate_devices()     # fill combos (no signal connections yet)
         self._restore_saved_state()  # apply saved pad files + device names
         self._start_audio()
@@ -476,12 +640,14 @@ class MainWindow(QMainWindow):
         # Cross-thread MIDI signals land on the GUI thread via Qt queued connections.
         self.midi.note_on.connect(self._on_note_on)
         self.midi.note_off.connect(self._on_note_off)
+        self.midi.cc.connect(self._on_cc)
 
     # ── UI construction ────────────────────────────────────────────────────
 
     def _build_ui(self):
         self.setWindowTitle("MIDI Piano & Soundboard")
-        self.setMinimumSize(600, 500)
+        self.setWindowIcon(_make_app_icon())
+        self.setMinimumSize(620, 460)
         self.setStyleSheet("""
             * { font-family: 'Segoe UI', sans-serif; }
             QMainWindow, QWidget { background:#14142a; color:#ccccee; }
@@ -500,6 +666,15 @@ class MainWindow(QMainWindow):
             }
             QPushButton:hover { background:#2e2e4e; }
             QLabel { color:#aaaacc; }
+            QSlider::groove:horizontal {
+                height:4px; background:#33335a; border-radius:2px;
+            }
+            QSlider::handle:horizontal {
+                width:14px; margin:-6px 0; border-radius:7px;
+                background:#7777ff;
+            }
+            QMenu { background:#22223a; color:#ccccee; border:1px solid #444466; }
+            QMenu::item:selected { background:#3c3c5c; }
         """)
 
         root = QWidget()
@@ -531,13 +706,30 @@ class MainWindow(QMainWindow):
         drow.addStretch()
         vbox.addLayout(drow)
 
+        # ── Master volume + panic button ───────────────────────────────────
+        vrow = QHBoxLayout()
+        vrow.setSpacing(8)
+        vrow.addWidget(QLabel("Volume:"))
+        self.vol_slider = QSlider(Qt.Orientation.Horizontal)
+        self.vol_slider.setRange(0, 100)
+        self.vol_slider.setValue(int(self.cfg.master * 100))
+        self.vol_slider.setMaximumWidth(220)
+        self.vol_slider.valueChanged.connect(self._on_master_changed)
+        vrow.addWidget(self.vol_slider)
+        vrow.addSpacing(12)
+        stop_btn = QPushButton("⏹  Stop All")
+        stop_btn.clicked.connect(self._on_stop_all)
+        vrow.addWidget(stop_btn)
+        vrow.addStretch()
+        vbox.addLayout(vrow)
+
         # ── Status line ────────────────────────────────────────────────────
         self.status = QLabel("Starting…")
         self.status.setStyleSheet("color:#555577; font-size:10px;")
         vbox.addWidget(self.status)
 
         # ── Pad grid header ────────────────────────────────────────────────
-        hint_top = QLabel("Soundboard  —  drag MP3 / WAV files onto pads")
+        hint_top = QLabel("Soundboard  —  drag MP3 / WAV files onto pads · right-click for options")
         hint_top.setStyleSheet("color:#555577; font-size:10px;")
         vbox.addWidget(hint_top)
 
@@ -547,15 +739,47 @@ class MainWindow(QMainWindow):
         for i in range(len(PAD_NOTES)):
             pad = PadWidget(i)
             pad.file_dropped.connect(self._on_pad_drop)
+            pad.cleared.connect(self._on_pad_clear)
+            pad.volume_changed.connect(self._on_pad_volume)
             self.pads.append(pad)
             grid.addWidget(pad, i // PAD_COLS, i % PAD_COLS)
         vbox.addLayout(grid)
 
         # ── Footer ─────────────────────────────────────────────────────────
-        hint_bot = QLabel("Ch 1 → piano keys  ·  Ch 10 → drum pads  ·  works while minimised")
+        hint_bot = QLabel("Ch 1 → piano keys  ·  Ch 10 → drum pads  ·  closing hides to tray")
         hint_bot.setAlignment(Qt.AlignmentFlag.AlignCenter)
         hint_bot.setStyleSheet("color:#383858; font-size:9px;")
         vbox.addWidget(hint_bot)
+
+    def _build_tray(self):
+        """System-tray icon so the app keeps running when the window closes."""
+        self.tray = None
+        if not QSystemTrayIcon.isSystemTrayAvailable():
+            return
+        self.tray = QSystemTrayIcon(_make_app_icon(), self)
+        menu = QMenu()
+        act_show = menu.addAction("Show window")
+        act_show.triggered.connect(self._tray_show)
+        act_quit = menu.addAction("Quit")
+        act_quit.triggered.connect(self._tray_quit)
+        self.tray.setContextMenu(menu)
+        self._tray_menu = menu          # keep a reference so Qt doesn't GC it
+        self.tray.setToolTip("MIDI Piano & Soundboard")
+        self.tray.activated.connect(self._on_tray_activated)
+        self.tray.show()
+
+    def _on_tray_activated(self, reason):
+        if reason == QSystemTrayIcon.ActivationReason.Trigger:
+            self._tray_show()
+
+    def _tray_show(self):
+        self.showNormal()
+        self.raise_()
+        self.activateWindow()
+
+    def _tray_quit(self):
+        self._quitting = True
+        self.close()
 
     # ── Device enumeration ─────────────────────────────────────────────────
 
@@ -603,17 +827,20 @@ class MainWindow(QMainWindow):
                     self.audio_cb.setCurrentIndex(i)
                     break
 
-        # Restore pad file assignments (only if the file still exists on disk).
+        # Restore pad assignments (only if the file still exists on disk).
         for pad_idx, path in self.cfg.pad_files.items():
-            if 0 <= pad_idx < 16 and Path(path).exists():
+            if 0 <= pad_idx < len(self.pads) and Path(path).exists():
                 self.pads[pad_idx].set_file(path)
+        for pad_idx, gain in self.cfg.pad_volumes.items():
+            if 0 <= pad_idx < len(self.pads):
+                self.pads[pad_idx].set_volume(gain)
 
     # ── Startup helpers ────────────────────────────────────────────────────
 
     def _start_audio(self):
         try:
             self.audio.start(self.audio_cb.currentData())
-            self.status.setText("Warming up piano samples…")
+            self.status.setText("Warming up piano notes…")
             threading.Thread(target=self._warm_up_worker, daemon=True).start()
         except Exception as e:
             self.status.setText(f"Audio error: {e}")
@@ -673,12 +900,31 @@ class MainWindow(QMainWindow):
         except Exception as e:
             self.status.setText(f"Audio error: {e}")
 
+    def _on_master_changed(self, value: int):
+        self.audio.set_master(value / 100)
+        self.cfg.master = value / 100
+        self.cfg.save()
+
+    def _on_stop_all(self):
+        self.audio.stop_all()
+        self.status.setText("Stopped all sounds")
+
     def _on_pad_drop(self, pad_idx: int, path: str):
         self.cfg.pad_files[pad_idx] = path
         self.cfg.save()
         # Preload in the background so the next trigger is instant.
         threading.Thread(target=self.audio.preload, args=(path,), daemon=True).start()
         self.status.setText(f"Pad {pad_idx + 1} → {Path(path).name}")
+
+    def _on_pad_clear(self, pad_idx: int):
+        self.cfg.pad_files.pop(pad_idx, None)
+        self.cfg.save()
+        self.status.setText(f"Pad {pad_idx + 1} cleared")
+
+    def _on_pad_volume(self, pad_idx: int, gain: float):
+        self.cfg.pad_volumes[pad_idx] = gain
+        self.cfg.save()
+        self.status.setText(f"Pad {pad_idx + 1} volume → {int(gain * 100)}%")
 
     # ── MIDI dispatch ──────────────────────────────────────────────────────
 
@@ -694,32 +940,61 @@ class MainWindow(QMainWindow):
 
         if ch == 1:
             # ── Piano: velocity-sensitive, polyphonic ──────────────────────
-            buf  = self.cache.get(note)
-            self.audio.play_note(buf, vel / 127.0)
+            buf = self.cache.get(note)
+            self.audio.play_note(buf, vel / 127.0, note)
             self.status.setText(f"Piano  {note_name(note)}  (vel {vel})")
 
         elif ch == 10:
             # ── Drum pads: fixed volume regardless of velocity ─────────────
             if note not in NOTE_TO_PAD:
+                self.status.setText(
+                    f"Pad note {note} not in Bank A mapping — is the pad bank set to A?")
                 return
             idx = NOTE_TO_PAD[note]
             self.pads[idx].flash()
             path = self.cfg.pad_files.get(idx, "")
             if path:
-                self.audio.play_pad(path)
+                self.audio.play_pad(path, idx, self.cfg.pad_volumes.get(idx, 1.0))
             else:
-                self.status.setText(f"Pad {idx + 1} (note {note}): no file assigned — drop a file onto it")
+                self.status.setText(
+                    f"Pad {idx + 1} (note {note}): no file assigned — drop a file onto it")
+
+        else:
+            # Anything else (e.g. pads switched to a different channel) is
+            # surfaced so misconfiguration is visible instead of silent.
+            self.status.setText(f"Note {note_name(note)} on ch {ch} (unrouted)")
 
     def _on_note_off(self, ch: int, note: int):
-        # Notes fade out via their synthesis envelope; no hard gate is needed.
-        pass
+        if ch == 1:
+            self.audio.note_off(note)
+
+    def _on_cc(self, ch: int, control: int, value: int):
+        """Knobs and pedals. CC64 = sustain; everything else just shows status."""
+        if control == SUSTAIN_CC:
+            self.audio.set_sustain(value >= 64)
+            self.status.setText(f"Sustain {'on' if value >= 64 else 'off'}")
+        else:
+            self.status.setText(f"Knob CC{control} = {value} (ch {ch}, unmapped)")
 
     # ── Shutdown ───────────────────────────────────────────────────────────
 
     def closeEvent(self, event):
+        # Close button hides to the tray so MIDI keeps working in-game.
+        if self.tray and not self._quitting:
+            event.ignore()
+            self.hide()
+            if not self._tray_warned:
+                self._tray_warned = True
+                self.tray.showMessage(
+                    "Still running",
+                    "MIDI Soundboard is in the system tray. Right-click the icon to quit.",
+                    QSystemTrayIcon.MessageIcon.Information, 4000)
+            return
         self.midi.stop_listener()
         self.audio.stop()
         self.cfg.save()
+        if self.tray:
+            self.tray.hide()
         event.accept()
 
 
@@ -732,6 +1007,9 @@ def main():
 
     app = QApplication(sys.argv)
     app.setApplicationName("MIDI Soundboard")
+    app.setWindowIcon(_make_app_icon())
+    # Keep running when the window is hidden to the tray.
+    app.setQuitOnLastWindowClosed(False)
     win = MainWindow()
     win.show()
     sys.exit(app.exec())
