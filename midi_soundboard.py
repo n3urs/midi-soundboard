@@ -46,8 +46,9 @@ MAX_POLYPHONY = 32      # oldest voice stolen when this limit is hit
 
 # Akai MPK Mini MkII Bank-A pad → MIDI note mapping.
 # The device has 8 pads in a 2×4 grid; top row is pads 5-8, bottom is 1-4.
-PAD_NOTES   = [40, 41, 42, 43,   # row 0 (top)    – pads 5-8
-               36, 37, 38, 39]   # row 1 (bottom) – pads 1-4
+# Notes match this unit's factory Program 1 layout (F1–G#1 top, C#1–E1 bottom).
+PAD_NOTES   = [29, 30, 31, 32,   # row 0 (top)    – pads 5-8  (F1, F#1, G1, G#1)
+               25, 26, 27, 28]   # row 1 (bottom) – pads 1-4  (C#1, D1, D#1, E1)
 NOTE_TO_PAD = {note: idx for idx, note in enumerate(PAD_NOTES)}
 PAD_COLS    = 4   # pads per row
 
@@ -474,10 +475,13 @@ class PadWidget(QFrame):
     cleared        = pyqtSignal(int)          # (pad_index)
     volume_changed = pyqtSignal(int, float)   # (pad_index, gain 0.0-1.0)
 
-    _C_EMPTY  = "#202030"
-    _C_LOADED = "#1a3326"
-    _C_FLASH  = "#4a7aff"
-    _C_DRAG   = "#2a3a5a"
+    # Visual states: (gradient top, gradient bottom, border, name colour)
+    _STATES = {
+        "empty":  ("#1a1e2b", "#151823", "#262c3d", "#4d5675"),
+        "loaded": ("#1e2a44", "#182032", "#3a4c78", "#d6def3"),
+        "flash":  ("#6c8cff", "#4a6ee8", "#9db4ff", "#ffffff"),
+        "drag":   ("#26365c", "#1e2a48", "#6c8cff", "#aebcf0"),
+    }
 
     def __init__(self, index: int):
         super().__init__()
@@ -490,58 +494,69 @@ class PadWidget(QFrame):
         self._timer.timeout.connect(self._dim)
 
         self.setAcceptDrops(True)
-        self.setMinimumSize(110, 84)
-        self.setFrameStyle(QFrame.Shape.Box)
+        self.setMinimumSize(124, 96)
 
         lay = QVBoxLayout(self)
-        lay.setContentsMargins(5, 5, 5, 5)
-        lay.setSpacing(2)
+        lay.setContentsMargins(10, 8, 10, 8)
+        lay.setSpacing(3)
 
-        self._num  = QLabel(f"Pad {index + 1}")
-        self._num.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._num.setFont(QFont("Segoe UI", 9, QFont.Weight.Bold))
+        self._num = QLabel(f"PAD {index + 1}")
+        self._num.setObjectName("padNum")
+        self._num.setAlignment(Qt.AlignmentFlag.AlignLeft)
 
-        self._name = QLabel("drop file")
+        self._name = QLabel("drop a file")
+        self._name.setObjectName("padName")
         self._name.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._name.setWordWrap(True)
-        self._name.setFont(QFont("Segoe UI", 7))
 
         self._vol = QLabel("")
-        self._vol.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._vol.setFont(QFont("Segoe UI", 7))
+        self._vol.setObjectName("padVol")
+        self._vol.setAlignment(Qt.AlignmentFlag.AlignRight)
 
         lay.addWidget(self._num)
+        lay.addStretch()
         lay.addWidget(self._name)
+        lay.addStretch()
         lay.addWidget(self._vol)
 
-        self._apply_bg(self._C_EMPTY)
+        self._set_state("empty")
 
-    def _apply_bg(self, color: str):
-        self.setStyleSheet(
-            f"PadWidget  {{ background:{color}; border:2px solid #404060; border-radius:6px; }}"
-            "QLabel      { color:#bbbbdd; background:transparent; }"
-        )
+    def _set_state(self, state: str):
+        top, bottom, border, name_col = self._STATES[state]
+        self.setStyleSheet(f"""
+            PadWidget {{
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                                            stop:0 {top}, stop:1 {bottom});
+                border: 1px solid {border};
+                border-radius: 10px;
+            }}
+            QLabel          {{ background: transparent; border: none; }}
+            QLabel#padNum   {{ color: #5d6790; font-size: 8pt; font-weight: 600;
+                               letter-spacing: 1px; }}
+            QLabel#padName  {{ color: {name_col}; font-size: 9pt; font-weight: 500; }}
+            QLabel#padVol   {{ color: #5d6790; font-size: 7pt; }}
+        """)
 
     # ── Public API ─────────────────────────────────────────────────────────
 
     def flash(self):
         """Brief blue flash to confirm the pad was triggered."""
-        self._apply_bg(self._C_FLASH)
+        self._set_state("flash")
         self._timer.start(140)
 
     def set_file(self, path: str):
         self.file_path = path
         stem = Path(path).stem if path else ""
-        display = (stem[:12] + "…") if len(stem) > 13 else (stem or "drop file")
+        display = (stem[:16] + "…") if len(stem) > 17 else (stem or "drop a file")
         self._name.setText(display)
         self._dim()
 
     def set_volume(self, gain: float):
         self.volume = gain
-        self._vol.setText(f"vol {int(gain * 100)}%" if gain < 1.0 else "")
+        self._vol.setText(f"{int(gain * 100)}%" if gain < 1.0 else "")
 
     def _dim(self):
-        self._apply_bg(self._C_LOADED if self.file_path else self._C_EMPTY)
+        self._set_state("loaded" if self.file_path else "empty")
 
     # ── Right-click menu ───────────────────────────────────────────────────
 
@@ -580,7 +595,7 @@ class PadWidget(QFrame):
             if any(Path(u.toLocalFile()).suffix.lower() in AUDIO_EXTS
                    for u in event.mimeData().urls()):
                 event.acceptProposedAction()
-                self._apply_bg(self._C_DRAG)
+                self._set_state("drag")
 
     def dragLeaveEvent(self, _event):
         self._dim()
@@ -647,95 +662,135 @@ class MainWindow(QMainWindow):
     def _build_ui(self):
         self.setWindowTitle("MIDI Piano & Soundboard")
         self.setWindowIcon(_make_app_icon())
-        self.setMinimumSize(620, 460)
+        self.setMinimumSize(640, 500)
         self.setStyleSheet("""
-            * { font-family: 'Segoe UI', sans-serif; }
-            QMainWindow, QWidget { background:#14142a; color:#ccccee; }
-            QComboBox {
-                background:#22223a; border:1px solid #444466; border-radius:4px;
-                padding:4px 8px; color:#ccccee; min-width:175px;
+            * { font-family: 'Segoe UI', 'SF Pro Text', -apple-system, sans-serif; }
+            QMainWindow, QWidget { background:#101218; color:#c9d1e8; }
+            QFrame#card {
+                background:#171a24; border:1px solid #232838; border-radius:12px;
             }
-            QComboBox::drop-down { border:none; }
+            QLabel#cardTitle {
+                color:#5d6790; font-size:8pt; font-weight:600; letter-spacing:2px;
+            }
+            QLabel#fieldLabel { color:#7b86ad; font-size:9pt; }
+            QComboBox {
+                background:#1d2230; border:1px solid #2c3347; border-radius:6px;
+                padding:5px 10px; color:#c9d1e8; min-width:175px; font-size:9pt;
+            }
+            QComboBox:hover { border-color:#3d4763; }
+            QComboBox::drop-down { border:none; width:22px; }
             QComboBox QAbstractItemView {
-                background:#22223a; color:#ccccee;
-                selection-background-color:#3c3c5c;
+                background:#1d2230; color:#c9d1e8; border:1px solid #2c3347;
+                selection-background-color:#2c3854; outline:none;
             }
             QPushButton {
-                background:#22223a; border:1px solid #505070;
-                border-radius:4px; padding:5px 14px; color:#aaaacc;
+                background:#1d2230; border:1px solid #2c3347; border-radius:6px;
+                padding:6px 16px; color:#aeb8d6; font-size:9pt;
             }
-            QPushButton:hover { background:#2e2e4e; }
-            QLabel { color:#aaaacc; }
+            QPushButton:hover { background:#252b3d; border-color:#6c8cff; color:#e3e8f7; }
+            QPushButton:pressed { background:#1a1f2e; }
+            QPushButton#stopBtn:hover { border-color:#ff6c7a; color:#ffb3bb; }
+            QLabel { color:#aeb8d6; }
             QSlider::groove:horizontal {
-                height:4px; background:#33335a; border-radius:2px;
+                height:4px; background:#252b3d; border-radius:2px;
             }
+            QSlider::sub-page:horizontal { background:#6c8cff; border-radius:2px; }
             QSlider::handle:horizontal {
-                width:14px; margin:-6px 0; border-radius:7px;
-                background:#7777ff;
+                width:14px; margin:-5px 0; border-radius:7px; background:#aebcf0;
             }
-            QMenu { background:#22223a; color:#ccccee; border:1px solid #444466; }
-            QMenu::item:selected { background:#3c3c5c; }
+            QSlider::handle:horizontal:hover { background:#d4ddfa; }
+            QMenu {
+                background:#1d2230; color:#c9d1e8; border:1px solid #2c3347;
+                border-radius:8px; padding:4px;
+            }
+            QMenu::item { padding:5px 22px; border-radius:4px; }
+            QMenu::item:selected { background:#2c3854; }
         """)
 
         root = QWidget()
         self.setCentralWidget(root)
         vbox = QVBoxLayout(root)
-        vbox.setContentsMargins(14, 14, 14, 10)
-        vbox.setSpacing(10)
+        vbox.setContentsMargins(18, 16, 18, 12)
+        vbox.setSpacing(12)
 
-        # ── Title ──────────────────────────────────────────────────────────
+        # ── Header: title + live status on one line ────────────────────────
+        hrow = QHBoxLayout()
         title = QLabel("MIDI Piano & Soundboard")
-        title.setFont(QFont("Segoe UI", 13, QFont.Weight.Bold))
-        title.setStyleSheet("color:#7777ff;")
-        vbox.addWidget(title)
+        title.setFont(QFont("Segoe UI", 14, QFont.Weight.Bold))
+        title.setStyleSheet("color:#e3e8f7;")
+        subtitle = QLabel("Akai MPK Mini MkII")
+        subtitle.setStyleSheet("color:#5d6790; font-size:9pt; padding-top:4px;")
+        hrow.addWidget(title)
+        hrow.addSpacing(8)
+        hrow.addWidget(subtitle)
+        hrow.addStretch()
+        self.status = QLabel("Starting…")
+        self.status.setStyleSheet("color:#6c8cff; font-size:9pt;")
+        self.status.setAlignment(Qt.AlignmentFlag.AlignRight |
+                                 Qt.AlignmentFlag.AlignVCenter)
+        hrow.addWidget(self.status)
+        vbox.addLayout(hrow)
 
-        # ── Device selectors ───────────────────────────────────────────────
+        # ── Card: devices + volume ─────────────────────────────────────────
+        card = QFrame()
+        card.setObjectName("card")
+        clay = QVBoxLayout(card)
+        clay.setContentsMargins(16, 12, 16, 14)
+        clay.setSpacing(10)
+
         drow = QHBoxLayout()
         drow.setSpacing(8)
-        drow.addWidget(QLabel("MIDI in:"))
+        lbl_midi = QLabel("MIDI in")
+        lbl_midi.setObjectName("fieldLabel")
+        drow.addWidget(lbl_midi)
         self.midi_cb = QComboBox()
-        drow.addWidget(self.midi_cb)
-        drow.addSpacing(10)
-        drow.addWidget(QLabel("Audio out:"))
+        drow.addWidget(self.midi_cb, 1)
+        drow.addSpacing(12)
+        lbl_audio = QLabel("Audio out")
+        lbl_audio.setObjectName("fieldLabel")
+        drow.addWidget(lbl_audio)
         self.audio_cb = QComboBox()
-        drow.addWidget(self.audio_cb)
-        drow.addSpacing(6)
+        drow.addWidget(self.audio_cb, 1)
+        drow.addSpacing(8)
         refresh = QPushButton("⟳  Refresh")
         refresh.clicked.connect(self._on_refresh)
         drow.addWidget(refresh)
-        drow.addStretch()
-        vbox.addLayout(drow)
+        clay.addLayout(drow)
 
-        # ── Master volume + panic button ───────────────────────────────────
         vrow = QHBoxLayout()
         vrow.setSpacing(8)
-        vrow.addWidget(QLabel("Volume:"))
+        lbl_vol = QLabel("Volume")
+        lbl_vol.setObjectName("fieldLabel")
+        vrow.addWidget(lbl_vol)
         self.vol_slider = QSlider(Qt.Orientation.Horizontal)
         self.vol_slider.setRange(0, 100)
         self.vol_slider.setValue(int(self.cfg.master * 100))
-        self.vol_slider.setMaximumWidth(220)
+        self.vol_slider.setMaximumWidth(240)
         self.vol_slider.valueChanged.connect(self._on_master_changed)
         vrow.addWidget(self.vol_slider)
-        vrow.addSpacing(12)
+        vrow.addStretch()
         stop_btn = QPushButton("⏹  Stop All")
+        stop_btn.setObjectName("stopBtn")
         stop_btn.clicked.connect(self._on_stop_all)
         vrow.addWidget(stop_btn)
-        vrow.addStretch()
-        vbox.addLayout(vrow)
+        clay.addLayout(vrow)
 
-        # ── Status line ────────────────────────────────────────────────────
-        self.status = QLabel("Starting…")
-        self.status.setStyleSheet("color:#555577; font-size:10px;")
-        vbox.addWidget(self.status)
+        vbox.addWidget(card)
 
-        # ── Pad grid header ────────────────────────────────────────────────
-        hint_top = QLabel("Soundboard  —  drag MP3 / WAV files onto pads · right-click for options")
-        hint_top.setStyleSheet("color:#555577; font-size:10px;")
-        vbox.addWidget(hint_top)
+        # ── Soundboard section ─────────────────────────────────────────────
+        srow = QHBoxLayout()
+        sb_title = QLabel("SOUNDBOARD")
+        sb_title.setObjectName("cardTitle")
+        srow.addWidget(sb_title)
+        srow.addStretch()
+        sb_hint = QLabel("drag files onto pads · right-click for options")
+        sb_hint.setStyleSheet("color:#444d6e; font-size:8pt;")
+        srow.addWidget(sb_hint)
+        vbox.addLayout(srow)
 
-        # ── 2 × 4 pad grid (matches MPK Mini MkII physical layout) ────────
+        # 2 × 4 pad grid (matches MPK Mini MkII physical layout)
         grid = QGridLayout()
-        grid.setSpacing(6)
+        grid.setSpacing(10)
         for i in range(len(PAD_NOTES)):
             pad = PadWidget(i)
             pad.file_dropped.connect(self._on_pad_drop)
@@ -743,12 +798,12 @@ class MainWindow(QMainWindow):
             pad.volume_changed.connect(self._on_pad_volume)
             self.pads.append(pad)
             grid.addWidget(pad, i // PAD_COLS, i % PAD_COLS)
-        vbox.addLayout(grid)
+        vbox.addLayout(grid, 1)
 
         # ── Footer ─────────────────────────────────────────────────────────
-        hint_bot = QLabel("Ch 1 → piano keys  ·  Ch 10 → drum pads  ·  closing hides to tray")
+        hint_bot = QLabel("ch 1 → piano keys   ·   ch 10 → drum pads   ·   closing hides to tray")
         hint_bot.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        hint_bot.setStyleSheet("color:#383858; font-size:9px;")
+        hint_bot.setStyleSheet("color:#363e5c; font-size:8pt;")
         vbox.addWidget(hint_bot)
 
     def _build_tray(self):
